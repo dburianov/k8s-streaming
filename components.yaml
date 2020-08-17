@@ -1,0 +1,507 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: streaming-v1
+  labels:
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: streaming-v1-sa
+  labels:
+    account: streaming-v1
+  namespace: streaming-v1
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: streaming-v1-gw
+  namespace: streaming-v1
+spec:
+  selector:
+    istio: ingressgateway 
+  servers:
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+    - "streaming-v1.k8s.local"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: streaming-v1
+  namespace: streaming-v1
+spec:
+  hosts:
+  - "streaming-v1.k8s.local"
+  gateways:
+  - streaming-v1-gw
+  http:
+  - match:
+    - uri:
+        prefix: /status-vts
+    - uri:
+        prefix: /hls
+    - uri:
+        prefix: /dash
+    - uri:
+        prefix: /thumbnail
+    - uri:
+        exact: /login
+    route:
+    - destination:
+        host: nginx-web
+        port:
+          number: 80
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: nfs
+  namespace: streaming-v1
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteMany
+  nfs:
+    server: NFS_SERVER_ADDRESS
+    path: "EXPORT_NAME"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs
+  namespace: streaming-v1
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-encoder-nginx-dot-conf-configmap
+  namespace: streaming-v1
+data:
+  nginx.conf: |+
+    worker_processes  auto;
+    worker_rlimit_nofile 8192;
+    #  error_log  /dev/stderr debug;
+    error_log  /dev/stderr info;
+    events {
+        worker_connections  4096;
+        multi_accept on;
+        use epoll;
+    }
+    http {
+      log_format rt_cache_2_json escape=json '{'    
+        '"remote_addr":"$remote_addr",'
+        '"remote_user":"$remote_user",'
+        '"http_x_forwarded_for":"$http_x_forwarded_for",'
+        '"time_local":"$time_local",'
+        '"request":"$request",'
+        '"status":"$status",'
+        '"body_bytes_sent":"$body_bytes_sent",'
+        '"http_referer":"$http_referer",'
+        '"http_user_agent":"$http_user_agent",'
+        '"request_time":"$request_time",'
+        '"http_Host":"$http_Host",'
+        '"server_addr":"$server_addr",'
+        '"server_name":"$server_name",'
+        '"upstream_connect_time":"$upstream_connect_time",'
+        '"upstream_header_time":"$upstream_header_time",'
+        '"upstream_response_time":"$upstream_response_time",'
+        '"upstream_cache_status":"$upstream_cache_status",'
+        '"upstream_addr":"$upstream_addr",'
+        '"upstream_status":"$upstream_status",'
+        '"gzip_ratio":"$gzip_ratio",'
+        '"scheme":"$scheme",'
+        '"cookie_x-referer":"$cookie_xreferer"'
+        '}';
+      sendfile        on;
+      keepalive_timeout  5;
+      tcp_nopush on;
+      tcp_nodelay on;
+      reset_timedout_connection on;
+      server_tokens off;
+      client_body_buffer_size 128k;
+      vhost_traffic_status_zone;
+      vhost_traffic_status_zone shared:vhost_traffic_status:1m;
+      vhost_traffic_status_filter_by_host on;
+      stream_server_traffic_status_zone;
+      server {
+        listen      80;
+        location / { deny all; }
+        location /status-vts {
+          access_log off;
+          vhost_traffic_status_display;
+          vhost_traffic_status_display_format html;
+        }
+        location /stat {
+          access_log off;
+          rtmp_stat all;
+          rtmp_stat_stylesheet stat.xsl;
+        }
+        location /stat.xsl {
+          access_log off;
+          # XML stylesheet to view RTMP stats.
+          # Copy stat.xsl wherever you want
+          # and put the full directory path here
+          root /usr/local/nginx/html/;
+        }
+      }
+    }
+    rtmp_auto_push on;
+    rtmp_auto_push_reconnect 1s;
+    rtmp {
+      server {
+        listen 1935;
+        notify_method get;
+        chunk_size 4000;
+        application hls {
+          live on;
+          meta copy;
+          session_relay on;
+          hls on;
+          hls_path /usr/local/nginx/html/video/hls;
+          hls_fragment 2s;
+          hls_playlist_length 10s;
+          hls_continuous on;
+          hls_fragment_naming timestamp;
+          #hls_variant _480p BANDWIDTH=832000;
+          #hls_variant _720p BANDWIDTH=1331000;
+          #hls_variant _1080p  BANDWIDTH=1832000;
+          dash off;
+          dash_path /usr/local/nginx/html/video/dash;
+          dash_fragment 2s;
+          dash_playlist_length 10s;
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-encoder
+  namespace: streaming-v1
+spec:
+#  type: ClusterIP
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
+    name: nginx-http
+#  - port: 443
+#    targetPort: 443
+#    name: nginx-https
+  - port: 1935
+    targetPort: 1935
+    name: nginx-rtmp
+  selector:
+    app: nginx-encoder
+---
+apiVersion: apps/v1 # for versions before 1.9.0 use apps/v1beta2
+kind: Deployment
+metadata:
+  name: nginx-encoder
+  labels:
+    app: nginx-encoder
+  namespace: streaming-v1
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: nginx-encoder
+      tier: backend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: nginx-encoder
+        tier: backend
+    spec:
+#      securityContext:
+#        runAsUser: 1000
+#        runAsGroup: 3000
+#        fsGroup: 2000
+      serviceAccountName: streaming-v1-sa
+      containers:
+      - name: nginx-encoder
+        image: registry-v2.burianov.net/nginx/nginx-rtmp
+        imagePullPolicy: Always
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 2048Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        ports:
+        - containerPort: 80
+          name: nginx80
+#        - containerPort: 443
+#          name: nginx443
+        - containerPort: 1935
+          name: nginx1935
+        volumeMounts:
+        - name: nginx-encoder-nginx-dot-conf-volume
+          mountPath: /usr/local/nginx/conf
+          readOnly: false
+        - name: nfs
+          mountPath: /usr/local/nginx/html/video
+        livenessProbe:
+          httpGet:
+            path: /status-vts
+            port: 80
+            httpHeaders:
+            - name: Custom-Header
+              value: Awesome
+          initialDelaySeconds: 30
+          periodSeconds: 3
+      initContainers:
+      - name: init-nginx-encoder
+        image: busybox
+        command: 
+          - /bin/sh
+          - "-c"
+          - "mkdir -p /usr/local/nginx/html/video/hls; mkdir -p /usr/local/nginx/html/video/dash; chmod 0777 /usr/local/nginx/html/video/hls; chmod 0777 /usr/local/nginx/html/video/dash"
+        volumeMounts:
+        - name: nfs
+          mountPath: /usr/local/nginx/html/video
+      volumes:
+      - name: nginx-encoder-nginx-dot-conf-volume
+        configMap:
+          name: nginx-encoder-nginx-dot-conf-configmap
+          defaultMode: 0755
+      - name: nfs
+        persistentVolumeClaim:
+          claimName: nfs
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-web-nginx-dot-conf-configmap
+  namespace: streaming-v1
+data:
+  nginx.conf: |+
+    worker_processes  auto;
+    worker_rlimit_nofile 8192;
+    #error_log  /dev/stderr debug;
+    error_log  /dev/stderr info;
+    events {
+        worker_connections  4096;
+        multi_accept on;
+        use epoll;
+    }
+    http {
+      log_format rt_cache_2_json escape=json '{'    
+        '"remote_addr":"$remote_addr",'
+        '"remote_user":"$remote_user",'
+        '"http_x_forwarded_for":"$http_x_forwarded_for",'
+        '"time_local":"$time_local",'
+        '"request":"$request",'
+        '"status":"$status",'
+        '"body_bytes_sent":"$body_bytes_sent",'
+        '"http_referer":"$http_referer",'
+        '"http_user_agent":"$http_user_agent",'
+        '"request_time":"$request_time",'
+        '"http_Host":"$http_Host",'
+        '"server_addr":"$server_addr",'
+        '"server_name":"$server_name",'
+        '"upstream_connect_time":"$upstream_connect_time",'
+        '"upstream_header_time":"$upstream_header_time",'
+        '"upstream_response_time":"$upstream_response_time",'
+        '"upstream_cache_status":"$upstream_cache_status",'
+        '"upstream_addr":"$upstream_addr",'
+        '"upstream_status":"$upstream_status",'
+        '"gzip_ratio":"$gzip_ratio",'
+        '"brotli_ratio":"$brotli_ratio",'
+        '"scheme":"$scheme",'
+        '"cookie_x-referer":"$cookie_xreferer"'
+        '}';
+      sendfile        on;
+      keepalive_timeout  5;
+      tcp_nopush on;
+      tcp_nodelay on;
+      reset_timedout_connection on;
+      server_tokens off;
+      client_body_buffer_size 128k;
+      brotli on;
+      brotli_static on;
+      #brotli_types text/plain text/html text/css application/json application/javascript application/x-javascript text/javascript text/xml application/xml application/rss+xml application/atom+xml application/rdf+xml;
+      brotli_types application/atom+xml application/javascript application/json application/rss+xml
+             application/vnd.ms-fontobject application/x-font-opentype application/x-font-truetype
+             application/x-font-ttf application/x-javascript application/xhtml+xml application/xml
+             font/eot font/opentype font/otf font/truetype image/svg+xml image/vnd.microsoft.icon
+             image/x-icon image/x-win-bitmap text/css text/javascript text/plain text/xml;
+      brotli_comp_level 11;
+      brotli_window 512k;
+      brotli_min_length 20;
+      gzip  on;
+      gzip_http_version 1.1;
+      gzip_vary on;
+      gzip_comp_level 9;
+      gzip_proxied any;
+      gzip_types text/plain text/html text/css application/json application/javascript application/x-javascript text/javascript text/xml application/xml application/rss+xml application/atom+xml application/rdf+xml;
+      gzip_buffers 32 16k;
+      gzip_disable “MSIE [1-6].(?!.*SV1)”;
+      vhost_traffic_status_zone;
+      vhost_traffic_status_zone shared:vhost_traffic_status:1m;
+      vhost_traffic_status_filter_by_host on;
+      stream_server_traffic_status_zone;
+      resolver 1.1.1.1 8.8.8.8;
+      access_log  /dev/stdout  rt_cache_2_json;
+      server {
+        listen      80;
+        server_name _;
+        client_max_body_size 16M;
+        root /usr/local/nginx/html;
+        location /status-vts {
+          access_log off;
+          vhost_traffic_status_display;
+          vhost_traffic_status_display_format html;
+        }
+        location ~* ^/hls/(.*)\.(m3u8|ts|js)$ {
+          types {
+            application/vnd.apple.mpegurl m3u8;
+          }
+          #root /tmp;
+          add_header Cache-Control no-cache;
+          try_files $uri /video$uri =206;
+        }
+        location ~* ^/dash/(.*)\.(mpd|m4v|m4a)$ {
+          types {
+            video/mp2t ts;
+          }
+          root /tmp;
+          add_header Cache-Control no-cache;
+          try_files $uri /video$uri =206;
+        }
+        location ~* ^/thumbnail/(.*).png {
+          try_files $uri /video$uri =206;
+        }
+        location / { deny all; }
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-web
+  namespace: streaming-v1
+spec:
+#  type: ClusterIP
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 80
+    name: nginx-http
+  - port: 443
+    targetPort: 443
+    name: nginx-https
+  selector:
+    app: nginx-web
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-web
+  labels:
+    app: nginx-web
+  namespace: streaming-v1
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  selector:
+    matchLabels:
+      app: nginx-web
+      tier: backend
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: nginx-web
+        tier: backend
+    spec:
+      serviceAccountName: streaming-v1-sa
+      containers:
+      - name: nginx-web
+        image: registry-v2.burianov.net/nginx/nginx-rtmp
+        imagePullPolicy: Always
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 2048Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi
+        ports:
+        - containerPort: 80
+          name: nginx80
+        - containerPort: 443
+          name: nginx443
+        volumeMounts:
+        - name: nginx-web-nginx-dot-conf-volume
+          mountPath: /usr/local/nginx/conf
+          readOnly: false
+        - name: nfs
+          mountPath: /usr/local/nginx/html/video
+        livenessProbe:
+          httpGet:
+            path: /status-vts
+            port: 80
+            httpHeaders:
+            - name: Custom-Header
+              value: Awesome
+          initialDelaySeconds: 30
+          periodSeconds: 3
+      initContainers:
+      - name: init-nginx-web
+        image: busybox
+        command: 
+          - /bin/sh
+          - "-c"
+          - "mkdir -p /usr/local/nginx/html/video/hls; mkdir -p /usr/local/nginx/html/video/dash; chmod 0777 /usr/local/nginx/html/video/hls; chmod 0777 /usr/local/nginx/html/video/dash"
+          - "sysctl -w net.core.somaxconn=32768; sysctl -w net.ipv4.ip_local_port_range='1024 65535'; sysctl -w fs.file-max=1608170"
+        volumeMounts:
+        - name: nfs
+          mountPath: /usr/local/nginx/html/video
+      volumes:
+      - name: nginx-web-nginx-dot-conf-volume
+        configMap:
+          name: nginx-web-nginx-dot-conf-configmap
+          defaultMode: 0755
+      - name: nfs
+        persistentVolumeClaim:
+          claimName: nfs
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: nginx-web
+  namespace: streaming-v1
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nginx-web
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+---
+
